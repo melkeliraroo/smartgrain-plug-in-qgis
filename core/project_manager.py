@@ -39,6 +39,16 @@ class ProjectManager:
         project_data["diretorio"] = str(project_file_path.parent)
         return project_data
 
+    def save_project(self, project_data):
+        project_dir = project_data.get("diretorio")
+
+        if not project_dir:
+            raise ValueError("O projeto não possui um diretório definido.")
+
+        project_path = Path(project_dir)
+        self._write_project_file(project_path, project_data)
+        return project_data
+
     def _write_project_file(self, project_path, project_data):
         project_file_path = project_path / self.PROJECT_FILE_NAME
 
