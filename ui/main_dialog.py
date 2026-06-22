@@ -1,4 +1,7 @@
+from pathlib import Path
+
 from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -40,9 +43,41 @@ class MainDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout()
+        layout.addWidget(self._build_header())
         layout.addWidget(self.tabs)
         layout.addWidget(buttons)
         self.setLayout(layout)
+
+    def _build_header(self):
+        header = QWidget()
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(0, 0, 0, 8)
+
+        logo_label = QLabel()
+        logo_path = self._logo_path()
+
+        if logo_path.exists():
+            pixmap = QPixmap(str(logo_path))
+            logo_label.setPixmap(
+                pixmap.scaled(
+                    180,
+                    64,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+            logo_label.setFixedSize(190, 70)
+        else:
+            logo_label.setText("SmartGrain")
+            logo_label.setStyleSheet("font-size: 22px; font-weight: 700;")
+
+        logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(logo_label)
+        layout.addStretch()
+        return header
+
+    def _logo_path(self):
+        return Path(__file__).resolve().parents[1] / "assets" / "logo.png"
 
     def _build_project_tab(self):
         tab = QWidget()
