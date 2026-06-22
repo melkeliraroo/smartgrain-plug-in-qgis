@@ -1,0 +1,8 @@
+[general]
+name=SmartGrain
+description=Plugin para criação de projetos de agricultura de precisão no QGIS
+version=0.1.0
+qgisMinimumVersion=3.28
+author=Melkezedeque Alves Lira
+email=melke.liraroo@gmail.com
+category=Plugins
