@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from qgis.core import QgsMapLayerType, QgsProject, QgsWkbTypes
+from qgis.core import QgsDistanceArea, QgsMapLayerType, QgsProject, QgsWkbTypes
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import (
@@ -219,6 +219,9 @@ class MainDialog(QDialog):
 
         self.field_layer_combo = QComboBox()
         self.field_layer_combo.setMinimumWidth(360)
+        self.field_layer_combo.currentIndexChanged.connect(
+            self._update_field_layer_summary
+        )
 
         refresh_button = QPushButton("Atualizar camadas")
         refresh_button.clicked.connect(self._load_field_layers)
@@ -237,12 +240,20 @@ class MainDialog(QDialog):
         )
         self.field_layer_status.setWordWrap(True)
 
+        self.field_layer_summary = QLabel("Nenhuma camada selecionada.")
+        self.field_layer_summary.setWordWrap(True)
+        self.field_layer_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.field_layer_summary.setStyleSheet(
+            "background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px;"
+        )
+
         actions = QHBoxLayout()
         actions.addWidget(save_button)
         actions.addStretch()
 
         layout.addWidget(fields_box)
         layout.addWidget(self.field_layer_status)
+        layout.addWidget(self.field_layer_summary)
         layout.addLayout(actions)
         layout.addStretch()
 
@@ -263,6 +274,7 @@ class MainDialog(QDialog):
             self.field_layer_status.setText(
                 "Nenhuma camada vetorial de polígonos foi encontrada no projeto QGIS."
             )
+            self.field_layer_summary.setText("Nenhuma camada selecionada.")
             return
 
         for layer in polygon_layers:
@@ -273,6 +285,7 @@ class MainDialog(QDialog):
         self.field_layer_status.setText(
             f"{len(polygon_layers)} camada(s) de polígono disponível(is)."
         )
+        self._update_field_layer_summary()
 
     def _save_field_layer(self):
         if not self.current_project:
@@ -304,6 +317,16 @@ class MainDialog(QDialog):
             self._load_field_layers()
             return
 
+        summary = self._field_layer_summary(layer)
+        self.current_project["talhoes"] = {
+            "camada": {
+                "id": layer.id(),
+                "nome": layer.name(),
+                "fonte": layer.source(),
+            },
+            "resumo": summary,
+        }
+
         self.current_project["camada_talhoes"] = {
             "id": layer.id(),
             "nome": layer.name(),
@@ -323,11 +346,103 @@ class MainDialog(QDialog):
         self.field_layer_status.setText(
             f"Camada de talhões salva: {layer.name()}"
         )
+        self.field_layer_summary.setText(self._format_field_summary(summary))
         QMessageBox.information(
             self,
             "Talhões",
             "Camada de talhões salva no projeto.",
         )
+
+    def _update_field_layer_summary(self):
+        if not hasattr(self, "field_layer_summary"):
+            return
+
+        layer_id = self.field_layer_combo.currentData()
+
+        if not layer_id:
+            self.field_layer_summary.setText("Nenhuma camada selecionada.")
+            return
+
+        layer = QgsProject.instance().mapLayer(layer_id)
+
+        if layer is None:
+            self.field_layer_summary.setText(
+                "A camada selecionada não está mais carregada no QGIS."
+            )
+            return
+
+        self.field_layer_summary.setText(
+            self._format_field_summary(self._field_layer_summary(layer))
+        )
+
+    def _field_layer_summary(self, layer):
+        feature_count = layer.featureCount()
+        invalid_geometry_count = 0
+        empty_geometry_count = 0
+        total_area_m2 = 0.0
+        distance_area = QgsDistanceArea()
+        crs = layer.crs()
+
+        if crs.isValid():
+            distance_area.setSourceCrs(crs, QgsProject.instance().transformContext())
+
+        distance_area.setEllipsoid(QgsProject.instance().ellipsoid() or "WGS84")
+
+        for feature in layer.getFeatures():
+            geometry = feature.geometry()
+
+            if geometry is None or geometry.isEmpty():
+                empty_geometry_count += 1
+                continue
+
+            if not geometry.isGeosValid():
+                invalid_geometry_count += 1
+
+            total_area_m2 += distance_area.measureArea(geometry)
+
+        warnings = []
+
+        if feature_count == 0:
+            warnings.append("A camada não possui feições.")
+
+        if not crs.isValid():
+            warnings.append("A camada não possui sistema de coordenadas válido.")
+
+        if empty_geometry_count:
+            warnings.append(f"{empty_geometry_count} feição(ões) sem geometria.")
+
+        if invalid_geometry_count:
+            warnings.append(f"{invalid_geometry_count} geometria(s) inválida(s).")
+
+        return {
+            "quantidade_talhoes": int(feature_count),
+            "area_total_ha": round(total_area_m2 / 10000, 4),
+            "crs": crs.authid() or crs.description() or "Indefinido",
+            "crs_valido": crs.isValid(),
+            "geometrias_vazias": empty_geometry_count,
+            "geometrias_invalidas": invalid_geometry_count,
+            "fonte": layer.source(),
+            "avisos": warnings,
+        }
+
+    def _format_field_summary(self, summary):
+        lines = [
+            f"Talhões: {summary['quantidade_talhoes']}",
+            f"Área total: {summary['area_total_ha']:.4f} ha",
+            f"SRC/CRS: {summary['crs']}",
+            f"Geometrias vazias: {summary['geometrias_vazias']}",
+            f"Geometrias inválidas: {summary['geometrias_invalidas']}",
+        ]
+
+        if summary["avisos"]:
+            lines.append("")
+            lines.append("Avisos:")
+            lines.extend(f"- {warning}" for warning in summary["avisos"])
+        else:
+            lines.append("")
+            lines.append("Validação básica: sem avisos.")
+
+        return "\n".join(lines)
 
     def _polygon_layers(self):
         layers = []
@@ -347,7 +462,10 @@ class MainDialog(QDialog):
         if not self.current_project:
             return None
 
-        field_layer = self.current_project.get("camada_talhoes", {})
+        fields = self.current_project.get("talhoes", {})
+        field_layer = fields.get("camada") or self.current_project.get(
+            "camada_talhoes", {}
+        )
         return field_layer.get("id")
 
     def _restore_selected_field_layer(self):
@@ -355,12 +473,20 @@ class MainDialog(QDialog):
             return
 
         self._load_field_layers()
-        field_layer = (self.current_project or {}).get("camada_talhoes")
+        fields = (self.current_project or {}).get("talhoes", {})
+        field_layer = fields.get("camada") or (self.current_project or {}).get(
+            "camada_talhoes"
+        )
 
         if field_layer:
             self.field_layer_status.setText(
                 f"Camada de talhões salva: {field_layer.get('nome', '')}"
             )
+
+        summary = fields.get("resumo")
+
+        if summary:
+            self.field_layer_summary.setText(self._format_field_summary(summary))
 
     def _select_field_layer(self, layer_id):
         if not layer_id:
