@@ -165,6 +165,7 @@ class MainDialog(QDialog):
             "Projeto criado com sucesso.",
         )
         self._restore_selected_field_layer()
+        self._restore_selected_soil_sample_layer()
 
     def _open_project(self):
         project_file, _ = QFileDialog.getOpenFileName(
@@ -189,6 +190,7 @@ class MainDialog(QDialog):
 
         self._fill_project_form(self.current_project)
         self._restore_selected_field_layer()
+        self._restore_selected_soil_sample_layer()
         QMessageBox.information(
             self,
             "Projeto",
@@ -489,19 +491,291 @@ class MainDialog(QDialog):
             self.field_layer_summary.setText(self._format_field_summary(summary))
 
     def _select_field_layer(self, layer_id):
+        self._select_combo_layer(self.field_layer_combo, layer_id)
+
+    def _select_combo_layer(self, combo, layer_id):
         if not layer_id:
             return
 
-        index = self.field_layer_combo.findData(layer_id)
+        index = combo.findData(layer_id)
 
         if index >= 0:
-            self.field_layer_combo.setCurrentIndex(index)
+            combo.setCurrentIndex(index)
 
     def _build_data_tab(self):
-        return self._build_placeholder_tab(
-            "Entrada de dados agronômicos.",
-            "Esta aba pode receber mapas de produtividade, pontos de solo, imagens, grades e camadas vetoriais.",
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        data_box = QGroupBox("Amostras de solo")
+        form = QFormLayout(data_box)
+
+        self.soil_sample_layer_combo = QComboBox()
+        self.soil_sample_layer_combo.setMinimumWidth(360)
+        self.soil_sample_layer_combo.currentIndexChanged.connect(
+            self._update_soil_sample_summary
         )
+
+        refresh_button = QPushButton("Atualizar camadas")
+        refresh_button.clicked.connect(self._load_soil_sample_layers)
+
+        save_button = QPushButton("Salvar amostras de solo")
+        save_button.clicked.connect(self._save_soil_sample_layer)
+
+        layer_layout = QHBoxLayout()
+        layer_layout.addWidget(self.soil_sample_layer_combo)
+        layer_layout.addWidget(refresh_button)
+
+        form.addRow("Camada:", layer_layout)
+
+        self.soil_sample_status = QLabel(
+            "Carregue uma camada vetorial de pontos no QGIS e clique em Atualizar camadas."
+        )
+        self.soil_sample_status.setWordWrap(True)
+
+        self.soil_sample_summary = QLabel("Nenhuma camada selecionada.")
+        self.soil_sample_summary.setWordWrap(True)
+        self.soil_sample_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.soil_sample_summary.setStyleSheet(
+            "background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px;"
+        )
+
+        actions = QHBoxLayout()
+        actions.addWidget(save_button)
+        actions.addStretch()
+
+        layout.addWidget(data_box)
+        layout.addWidget(self.soil_sample_status)
+        layout.addWidget(self.soil_sample_summary)
+        layout.addLayout(actions)
+        layout.addStretch()
+
+        self._load_soil_sample_layers()
+        return tab
+
+    def _load_soil_sample_layers(self):
+        if not hasattr(self, "soil_sample_layer_combo"):
+            return
+
+        current_layer_id = self.soil_sample_layer_combo.currentData()
+        self.soil_sample_layer_combo.clear()
+
+        point_layers = self._point_layers()
+
+        if not point_layers:
+            self.soil_sample_layer_combo.addItem("Nenhuma camada de ponto encontrada", "")
+            self.soil_sample_status.setText(
+                "Nenhuma camada vetorial de pontos foi encontrada no projeto QGIS."
+            )
+            self.soil_sample_summary.setText("Nenhuma camada selecionada.")
+            return
+
+        for layer in point_layers:
+            self.soil_sample_layer_combo.addItem(layer.name(), layer.id())
+
+        selected_layer_id = self._saved_soil_sample_layer_id() or current_layer_id
+        self._select_combo_layer(self.soil_sample_layer_combo, selected_layer_id)
+        self.soil_sample_status.setText(
+            f"{len(point_layers)} camada(s) de ponto disponível(is)."
+        )
+        self._update_soil_sample_summary()
+
+    def _save_soil_sample_layer(self):
+        if not self.current_project:
+            QMessageBox.warning(
+                self,
+                "Dados",
+                "Crie ou abra um projeto antes de salvar as amostras de solo.",
+            )
+            return
+
+        layer_id = self.soil_sample_layer_combo.currentData()
+
+        if not layer_id:
+            QMessageBox.warning(
+                self,
+                "Dados",
+                "Selecione uma camada de pontos válida.",
+            )
+            return
+
+        layer = QgsProject.instance().mapLayer(layer_id)
+
+        if layer is None:
+            QMessageBox.warning(
+                self,
+                "Dados",
+                "A camada selecionada não está mais carregada no QGIS.",
+            )
+            self._load_soil_sample_layers()
+            return
+
+        summary = self._soil_sample_summary(layer)
+        data = self.current_project.setdefault("dados", {})
+        data["amostras_solo"] = {
+            "camada": {
+                "id": layer.id(),
+                "nome": layer.name(),
+                "fonte": layer.source(),
+            },
+            "resumo": summary,
+        }
+
+        try:
+            self.project_manager.save_project(self.current_project)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self,
+                "Dados",
+                f"Não foi possível salvar as amostras de solo:\n{error}",
+            )
+            return
+
+        self.soil_sample_status.setText(
+            f"Amostras de solo salvas: {layer.name()}"
+        )
+        self.soil_sample_summary.setText(self._format_soil_sample_summary(summary))
+        QMessageBox.information(
+            self,
+            "Dados",
+            "Amostras de solo salvas no projeto.",
+        )
+
+    def _update_soil_sample_summary(self):
+        if not hasattr(self, "soil_sample_summary"):
+            return
+
+        layer_id = self.soil_sample_layer_combo.currentData()
+
+        if not layer_id:
+            self.soil_sample_summary.setText("Nenhuma camada selecionada.")
+            return
+
+        layer = QgsProject.instance().mapLayer(layer_id)
+
+        if layer is None:
+            self.soil_sample_summary.setText(
+                "A camada selecionada não está mais carregada no QGIS."
+            )
+            return
+
+        self.soil_sample_summary.setText(
+            self._format_soil_sample_summary(self._soil_sample_summary(layer))
+        )
+
+    def _soil_sample_summary(self, layer):
+        crs = layer.crs()
+        numeric_fields = self._numeric_field_names(layer)
+        warnings = []
+        feature_count = layer.featureCount()
+
+        if feature_count == 0:
+            warnings.append("A camada não possui pontos de amostragem.")
+
+        if not crs.isValid():
+            warnings.append("A camada não possui sistema de coordenadas válido.")
+
+        if not numeric_fields:
+            warnings.append("A camada não possui campos numéricos para análise.")
+
+        return {
+            "quantidade_pontos": int(feature_count),
+            "crs": crs.authid() or crs.description() or "Indefinido",
+            "crs_valido": crs.isValid(),
+            "campos_numericos": numeric_fields,
+            "quantidade_campos_numericos": len(numeric_fields),
+            "fonte": layer.source(),
+            "avisos": warnings,
+        }
+
+    def _format_soil_sample_summary(self, summary):
+        fields = summary["campos_numericos"]
+        field_text = ", ".join(fields) if fields else "Nenhum"
+
+        lines = [
+            f"Pontos de amostragem: {summary['quantidade_pontos']}",
+            f"SRC/CRS: {summary['crs']}",
+            f"Campos numéricos: {summary['quantidade_campos_numericos']}",
+            f"Campos disponíveis: {field_text}",
+        ]
+
+        if summary["avisos"]:
+            lines.append("")
+            lines.append("Avisos:")
+            lines.extend(f"- {warning}" for warning in summary["avisos"])
+        else:
+            lines.append("")
+            lines.append("Validação básica: sem avisos.")
+
+        return "\n".join(lines)
+
+    def _point_layers(self):
+        layers = []
+
+        for layer in QgsProject.instance().mapLayers().values():
+            if layer.type() != QgsMapLayerType.VectorLayer:
+                continue
+
+            if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PointGeometry:
+                continue
+
+            layers.append(layer)
+
+        return sorted(layers, key=lambda layer: layer.name().lower())
+
+    def _numeric_field_names(self, layer):
+        field_names = []
+        numeric_type_names = (
+            "int",
+            "integer",
+            "long",
+            "double",
+            "real",
+            "float",
+            "decimal",
+            "numeric",
+        )
+
+        for field in layer.fields():
+            if hasattr(field, "isNumeric") and field.isNumeric():
+                field_names.append(field.name())
+                continue
+
+            type_name = field.typeName().lower()
+
+            if any(name in type_name for name in numeric_type_names):
+                field_names.append(field.name())
+
+        return field_names
+
+    def _saved_soil_sample_layer_id(self):
+        if not self.current_project:
+            return None
+
+        data = self.current_project.get("dados", {})
+        soil_samples = data.get("amostras_solo", {})
+        layer = soil_samples.get("camada", {})
+        return layer.get("id")
+
+    def _restore_selected_soil_sample_layer(self):
+        if not hasattr(self, "soil_sample_layer_combo"):
+            return
+
+        self._load_soil_sample_layers()
+        data = (self.current_project or {}).get("dados", {})
+        soil_samples = data.get("amostras_solo", {})
+        layer = soil_samples.get("camada")
+
+        if layer:
+            self.soil_sample_status.setText(
+                f"Amostras de solo salvas: {layer.get('nome', '')}"
+            )
+
+        summary = soil_samples.get("resumo")
+
+        if summary:
+            self.soil_sample_summary.setText(
+                self._format_soil_sample_summary(summary)
+            )
 
     def _build_analysis_tab(self):
         return self._build_placeholder_tab(
