@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from qgis.core import QgsDistanceArea, QgsMapLayerType, QgsProject, QgsWkbTypes
+from qgis.core import (
+    QgsCoordinateTransform,
+    QgsDistanceArea,
+    QgsGeometry,
+    QgsMapLayerType,
+    QgsProject,
+    QgsWkbTypes,
+)
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import (
@@ -166,6 +173,7 @@ class MainDialog(QDialog):
         )
         self._restore_selected_field_layer()
         self._restore_selected_soil_sample_layer()
+        self._restore_analysis_options()
 
     def _open_project(self):
         project_file, _ = QFileDialog.getOpenFileName(
@@ -191,6 +199,7 @@ class MainDialog(QDialog):
         self._fill_project_form(self.current_project)
         self._restore_selected_field_layer()
         self._restore_selected_soil_sample_layer()
+        self._restore_analysis_options()
         QMessageBox.information(
             self,
             "Projeto",
@@ -349,6 +358,7 @@ class MainDialog(QDialog):
             f"Camada de talhões salva: {layer.name()}"
         )
         self.field_layer_summary.setText(self._format_field_summary(summary))
+        self._restore_analysis_options()
         QMessageBox.information(
             self,
             "Talhões",
@@ -634,6 +644,7 @@ class MainDialog(QDialog):
             f"Amostras de solo salvas: {layer.name()}"
         )
         self.soil_sample_summary.setText(self._format_soil_sample_summary(summary))
+        self._restore_analysis_options()
         QMessageBox.information(
             self,
             "Dados",
@@ -778,10 +789,319 @@ class MainDialog(QDialog):
             )
 
     def _build_analysis_tab(self):
-        return self._build_placeholder_tab(
-            "Análises e diagnósticos.",
-            "Aqui entram estatísticas, interpolação, zonas de manejo e cruzamento de camadas.",
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        analysis_box = QGroupBox("Amostras por talhão")
+        form = QFormLayout(analysis_box)
+
+        self.analysis_field_combo = QComboBox()
+        self.analysis_field_combo.setMinimumWidth(240)
+
+        refresh_button = QPushButton("Atualizar dados")
+        refresh_button.clicked.connect(self._restore_analysis_options)
+
+        run_button = QPushButton("Executar análise")
+        run_button.clicked.connect(self._run_samples_by_field_analysis)
+
+        field_layout = QHBoxLayout()
+        field_layout.addWidget(self.analysis_field_combo)
+        field_layout.addWidget(refresh_button)
+
+        form.addRow("Atributo:", field_layout)
+
+        self.analysis_status = QLabel(
+            "Salve uma camada de talhões e uma camada de amostras de solo antes de executar."
         )
+        self.analysis_status.setWordWrap(True)
+
+        self.analysis_summary = QLabel("Nenhuma análise executada.")
+        self.analysis_summary.setWordWrap(True)
+        self.analysis_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.analysis_summary.setStyleSheet(
+            "background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px;"
+        )
+
+        actions = QHBoxLayout()
+        actions.addWidget(run_button)
+        actions.addStretch()
+
+        layout.addWidget(analysis_box)
+        layout.addWidget(self.analysis_status)
+        layout.addWidget(self.analysis_summary)
+        layout.addLayout(actions)
+        layout.addStretch()
+
+        self._restore_analysis_options()
+        return tab
+
+    def _restore_analysis_options(self):
+        if not hasattr(self, "analysis_field_combo"):
+            return
+
+        current_field = self.analysis_field_combo.currentData()
+        self.analysis_field_combo.clear()
+
+        soil_layer = self._saved_soil_sample_layer()
+        field_layer = self._saved_field_layer()
+
+        if field_layer is None or soil_layer is None:
+            self.analysis_field_combo.addItem("Nenhum campo disponível", "")
+            self.analysis_status.setText(
+                "Salve uma camada de talhões e uma camada de amostras de solo antes de executar."
+            )
+            self.analysis_summary.setText("Nenhuma análise executada.")
+            return
+
+        numeric_fields = self._numeric_field_names(soil_layer)
+        self.analysis_field_combo.addItem("Somente contar pontos", "")
+
+        for field_name in numeric_fields:
+            self.analysis_field_combo.addItem(field_name, field_name)
+
+        self._select_combo_layer(self.analysis_field_combo, current_field)
+        self.analysis_status.setText(
+            "Dados prontos para cruzar amostras de solo com talhões."
+        )
+
+        saved_analysis = (self.current_project or {}).get("analises", {}).get(
+            "amostras_por_talhao"
+        )
+
+        if saved_analysis:
+            self.analysis_summary.setText(
+                self._format_samples_by_field_analysis(saved_analysis)
+            )
+
+    def _run_samples_by_field_analysis(self):
+        if not self.current_project:
+            QMessageBox.warning(
+                self,
+                "Análises",
+                "Crie ou abra um projeto antes de executar a análise.",
+            )
+            return
+
+        field_layer = self._saved_field_layer()
+        soil_layer = self._saved_soil_sample_layer()
+
+        if field_layer is None or soil_layer is None:
+            QMessageBox.warning(
+                self,
+                "Análises",
+                "Salve uma camada de talhões e uma camada de amostras de solo antes de executar.",
+            )
+            self._restore_analysis_options()
+            return
+
+        attribute_name = self.analysis_field_combo.currentData()
+        analysis = self._samples_by_field_analysis(
+            field_layer,
+            soil_layer,
+            attribute_name,
+        )
+
+        analyses = self.current_project.setdefault("analises", {})
+        analyses["amostras_por_talhao"] = analysis
+
+        try:
+            self.project_manager.save_project(self.current_project)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self,
+                "Análises",
+                f"Não foi possível salvar a análise:\n{error}",
+            )
+            return
+
+        self.analysis_status.setText("Análise salva no projeto.")
+        self.analysis_summary.setText(
+            self._format_samples_by_field_analysis(analysis)
+        )
+        QMessageBox.information(
+            self,
+            "Análises",
+            "Análise concluída e salva no projeto.",
+        )
+
+    def _samples_by_field_analysis(self, field_layer, soil_layer, attribute_name):
+        soil_features = self._soil_sample_geometries_for_analysis(
+            soil_layer,
+            field_layer.crs(),
+            attribute_name,
+        )
+        total_inside = 0
+        results = []
+
+        for field_feature in field_layer.getFeatures():
+            field_geometry = field_feature.geometry()
+
+            if field_geometry is None or field_geometry.isEmpty():
+                continue
+
+            matched_values = []
+            sample_count = 0
+
+            for sample in soil_features:
+                if not field_geometry.contains(sample["geometry"]):
+                    continue
+
+                sample_count += 1
+
+                if sample["value"] is not None:
+                    matched_values.append(sample["value"])
+
+            total_inside += sample_count
+            average = None
+
+            if matched_values:
+                average = round(sum(matched_values) / len(matched_values), 4)
+
+            results.append(
+                {
+                    "talhao_id": int(field_feature.id()),
+                    "talhao_nome": self._field_feature_label(field_feature),
+                    "quantidade_amostras": sample_count,
+                    "media": average,
+                }
+            )
+
+        return {
+            "talhoes": results,
+            "total_talhoes": len(results),
+            "total_amostras": len(soil_features),
+            "amostras_dentro_talhoes": total_inside,
+            "amostras_fora_talhoes": max(len(soil_features) - total_inside, 0),
+            "atributo": attribute_name or "",
+            "camada_talhoes": field_layer.name(),
+            "camada_amostras": soil_layer.name(),
+        }
+
+    def _soil_sample_geometries_for_analysis(
+        self,
+        soil_layer,
+        target_crs,
+        attribute_name,
+    ):
+        coordinate_transform = None
+
+        if soil_layer.crs().isValid() and target_crs.isValid():
+            if soil_layer.crs() != target_crs:
+                coordinate_transform = QgsCoordinateTransform(
+                    soil_layer.crs(),
+                    target_crs,
+                    QgsProject.instance(),
+                )
+
+        samples = []
+
+        for feature in soil_layer.getFeatures():
+            geometry = feature.geometry()
+
+            if geometry is None or geometry.isEmpty():
+                continue
+
+            geometry = QgsGeometry(geometry)
+
+            if coordinate_transform is not None:
+                geometry.transform(coordinate_transform)
+
+            value = None
+
+            if attribute_name:
+                raw_value = feature[attribute_name]
+
+                if raw_value not in (None, ""):
+                    try:
+                        value = float(raw_value)
+                    except (TypeError, ValueError):
+                        value = None
+
+            samples.append(
+                {
+                    "geometry": geometry,
+                    "value": value,
+                }
+            )
+
+        return samples
+
+    def _field_feature_label(self, feature):
+        preferred_names = ("nome", "name", "talhao", "talhão", "id", "codigo", "código")
+
+        for field_name in preferred_names:
+            if field_name in feature.fields().names():
+                value = feature[field_name]
+
+                if value not in (None, ""):
+                    return str(value)
+
+        return f"Talhão {feature.id()}"
+
+    def _format_samples_by_field_analysis(self, analysis):
+        attribute_name = analysis.get("atributo") or "nenhum"
+        lines = [
+            f"Camada de talhões: {analysis.get('camada_talhoes', '')}",
+            f"Camada de amostras: {analysis.get('camada_amostras', '')}",
+            f"Atributo analisado: {attribute_name}",
+            f"Talhões analisados: {analysis.get('total_talhoes', 0)}",
+            f"Amostras dentro dos talhões: {analysis.get('amostras_dentro_talhoes', 0)}",
+            f"Amostras fora dos talhões: {analysis.get('amostras_fora_talhoes', 0)}",
+            "",
+            "Resumo por talhão:",
+        ]
+
+        for result in analysis.get("talhoes", []):
+            line = (
+                f"- {result['talhao_nome']}: "
+                f"{result['quantidade_amostras']} amostra(s)"
+            )
+
+            if result.get("media") is not None:
+                line += f", média {result['media']:.4f}"
+
+            lines.append(line)
+
+        return "\n".join(lines)
+
+    def _saved_field_layer(self):
+        if not self.current_project:
+            return None
+
+        fields = self.current_project.get("talhoes", {})
+        layer_data = fields.get("camada") or self.current_project.get(
+            "camada_talhoes", {}
+        )
+        return self._saved_layer_from_data(layer_data)
+
+    def _saved_soil_sample_layer(self):
+        if not self.current_project:
+            return None
+
+        data = self.current_project.get("dados", {})
+        soil_samples = data.get("amostras_solo", {})
+        return self._saved_layer_from_data(soil_samples.get("camada", {}))
+
+    def _saved_layer_from_data(self, layer_data):
+        if not layer_data:
+            return None
+
+        layer = QgsProject.instance().mapLayer(layer_data.get("id", ""))
+
+        if layer is not None:
+            return layer
+
+        source = layer_data.get("fonte")
+        name = layer_data.get("nome")
+
+        for candidate in QgsProject.instance().mapLayers().values():
+            if source and candidate.source() == source:
+                return candidate
+
+            if name and candidate.name() == name:
+                return candidate
+
+        return None
 
     def _build_prescription_tab(self):
         return self._build_placeholder_tab(
