@@ -5,12 +5,17 @@ from pathlib import Path
 from qgis.core import (
     QgsCoordinateTransform,
     QgsDistanceArea,
+    QgsFeature,
+    QgsField,
+    QgsFields,
     QgsGeometry,
     QgsMapLayerType,
     QgsProject,
+    QgsVectorFileWriter,
+    QgsVectorLayer,
     QgsWkbTypes,
 )
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QVariant, Qt
 from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import (
     QComboBox,
@@ -1382,19 +1387,27 @@ class MainDialog(QDialog):
             "background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px;"
         )
 
-        export_project_button = QPushButton("Exportar projeto")
-        export_project_button.clicked.connect(self._export_project)
+        export_analysis_csv_button = QPushButton("Análise (CSV)")
+        export_analysis_csv_button.clicked.connect(self._export_analysis_to_csv)
 
-        export_analysis_button = QPushButton("Exportar análise para CSV")
-        export_analysis_button.clicked.connect(self._export_analysis_to_csv)
+        export_analysis_shp_button = QPushButton("Análise (Shapefile)")
+        export_analysis_shp_button.clicked.connect(self._export_analysis_to_shapefile)
 
-        export_prescription_button = QPushButton("Exportar prescrição para CSV")
-        export_prescription_button.clicked.connect(self._export_prescription_to_csv)
+        export_prescription_csv_button = QPushButton("Prescrição (CSV)")
+        export_prescription_csv_button.clicked.connect(self._export_prescription_to_csv)
+
+        export_prescription_shp_button = QPushButton("Prescrição (Shapefile)")
+        export_prescription_shp_button.clicked.connect(self._export_prescription_to_shapefile)
+
+        export_package_button = QPushButton("Pacote Agrícola")
+        export_package_button.clicked.connect(self._export_agricultural_package)
 
         actions = QHBoxLayout()
-        actions.addWidget(export_project_button)
-        actions.addWidget(export_analysis_button)
-        actions.addWidget(export_prescription_button)
+        actions.addWidget(export_analysis_csv_button)
+        actions.addWidget(export_analysis_shp_button)
+        actions.addWidget(export_prescription_csv_button)
+        actions.addWidget(export_prescription_shp_button)
+        actions.addWidget(export_package_button)
         actions.addStretch()
 
         layout.addWidget(export_box)
@@ -1416,16 +1429,32 @@ class MainDialog(QDialog):
 
         if export_ready:
             self.export_status.setText(
-                "Exportação disponível. Exporte projeto, análise ou prescrição."
+                "Exportação disponível. Exporte análise ou prescrição nos formatos desejados."
             )
             self.export_summary.setText(
-                "Use os botões abaixo para gerar arquivos CSV no diretório do projeto."
+                "Use os botões abaixo para gerar arquivos (CSV, Shapefile ou pacote agrícola)."
             )
         else:
             self.export_status.setText(
                 "Salve um projeto e gere análises/prescrições para ativar a exportação."
             )
             self.export_summary.setText("Nenhuma exportação gerada.")
+
+    def _choose_export_folder(self, default_dir=None):
+        """Abre diálogo para escolher pasta de exportação."""
+        if default_dir is None:
+            default_dir = (
+                self.current_project.get("diretorio")
+                if self.current_project
+                else ""
+            )
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Escolher pasta para exportação",
+            default_dir,
+        )
+        return folder if folder else None
 
     def _export_project(self):
         if not self.current_project:
@@ -1480,17 +1509,12 @@ class MainDialog(QDialog):
             )
             return
 
-        project_dir = self.current_project and self.current_project.get("diretorio")
+        export_dir = self._choose_export_folder()
 
-        if not project_dir:
-            QMessageBox.critical(
-                self,
-                "Exportação",
-                "O projeto não possui diretório definido.",
-            )
+        if not export_dir:
             return
 
-        csv_path = Path(project_dir) / "analise_talhoes.csv"
+        csv_path = Path(export_dir) / "analise_talhoes.csv"
         try:
             with csv_path.open("w", encoding="utf-8", newline="") as csvfile:
                 writer = csv.writer(csvfile)
@@ -1525,6 +1549,113 @@ class MainDialog(QDialog):
             "Análise exportada para CSV com sucesso.",
         )
 
+    def _export_analysis_to_shapefile(self):
+        analysis = self._saved_samples_by_field_analysis()
+        field_layer = self._saved_field_layer()
+
+        if not analysis:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Execute uma análise antes de exportar para Shapefile.",
+            )
+            return
+
+        if not field_layer:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Camada de talhões não encontrada.",
+            )
+            return
+
+        export_dir = self._choose_export_folder()
+
+        if not export_dir:
+            return
+
+        output_path = Path(export_dir) / "analise_talhoes.shp"
+
+        try:
+            memory_layer = self._create_analysis_layer_copy(field_layer, analysis)
+
+            writer = QgsVectorFileWriter.create(
+                str(output_path),
+                memory_layer.fields(),
+                memory_layer.wkbType(),
+                field_layer.crs(),
+            )
+
+            if writer.hasError() != QgsVectorFileWriter.NoError:
+                raise Exception(f"Erro ao criar shapefile: {writer.errorMessage()}")
+
+            for feature in memory_layer.getFeatures():
+                if not writer.addFeature(feature):
+                    raise Exception(f"Erro ao adicionar feature: {writer.lastError()}")
+
+            del writer
+
+            self.export_summary.setText(
+                f"Análise exportada para: {output_path.name}"
+            )
+            QMessageBox.information(
+                self,
+                "Exportação",
+                "Análise exportada para Shapefile com sucesso.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                f"Não foi possível exportar a análise para Shapefile:\n{error}",
+            )
+
+    def _create_analysis_layer_copy(self, field_layer, analysis):
+        """Cria uma camada em memória com os resultados da análise."""
+        memory_layer = QgsVectorLayer(
+            f"{QgsWkbTypes.geometryType(field_layer.wkbType())}?crs={field_layer.crs().authid()}",
+            "analise_temporaria",
+            "memory",
+        )
+
+        provider = memory_layer.dataProvider()
+
+        fields = QgsFields()
+        fields.append(QgsField("talhao_id", QVariant.Int))
+        fields.append(QgsField("talhao_nome", QVariant.String))
+        fields.append(QgsField("quantidade_amostras", QVariant.Int))
+        fields.append(QgsField("media", QVariant.Double))
+
+        provider.addAttributes(fields)
+        memory_layer.updateFields()
+
+        analysis_by_id = {
+            r["talhao_id"]: r for r in analysis.get("talhoes", [])
+        }
+
+        features = []
+
+        for feature in field_layer.getFeatures():
+            field_id = int(feature.id())
+            result = analysis_by_id.get(field_id, {})
+
+            new_feature = QgsFeature()
+            new_feature.setGeometry(feature.geometry())
+
+            attrs = [
+                field_id,
+                result.get("talhao_nome", ""),
+                result.get("quantidade_amostras", 0),
+                result.get("media"),
+            ]
+
+            new_feature.setAttributes(attrs)
+            features.append(new_feature)
+
+        provider.addFeatures(features)
+
+        return memory_layer
+
     def _export_prescription_to_csv(self):
         prescription = (self.current_project or {}).get("prescricoes", {}).get("por_talhao")
 
@@ -1536,17 +1667,12 @@ class MainDialog(QDialog):
             )
             return
 
-        project_dir = self.current_project and self.current_project.get("diretorio")
+        export_dir = self._choose_export_folder()
 
-        if not project_dir:
-            QMessageBox.critical(
-                self,
-                "Exportação",
-                "O projeto não possui diretório definido.",
-            )
+        if not export_dir:
             return
 
-        csv_path = Path(project_dir) / "prescricao_talhoes.csv"
+        csv_path = Path(export_dir) / "prescricao_talhoes.csv"
         try:
             with csv_path.open("w", encoding="utf-8", newline="") as csvfile:
                 writer = csv.writer(csvfile)
@@ -1585,18 +1711,207 @@ class MainDialog(QDialog):
             "Prescrição exportada para CSV com sucesso.",
         )
 
-    def _build_placeholder_tab(self, title, description):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+    def _export_prescription_to_shapefile(self):
+        prescription = (self.current_project or {}).get("prescricoes", {}).get("por_talhao")
+        field_layer = self._saved_field_layer()
 
-        title_label = QLabel(title)
-        title_label.setAlignment(Qt.AlignLeft)
-        title_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        if not prescription:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Gere uma prescrição antes de exportar para Shapefile.",
+            )
+            return
 
-        description_label = QLabel(description)
-        description_label.setWordWrap(True)
+        if not field_layer:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Camada de talhões não encontrada.",
+            )
+            return
 
-        layout.addWidget(title_label)
-        layout.addWidget(description_label)
-        layout.addStretch()
-        return tab
+        export_dir = self._choose_export_folder()
+
+        if not export_dir:
+            return
+
+        output_path = Path(export_dir) / "prescricao_talhoes.shp"
+
+        try:
+            memory_layer = self._create_prescription_layer_copy(field_layer, prescription)
+
+            writer = QgsVectorFileWriter.create(
+                str(output_path),
+                memory_layer.fields(),
+                memory_layer.wkbType(),
+                field_layer.crs(),
+            )
+
+            if writer.hasError() != QgsVectorFileWriter.NoError:
+                raise Exception(f"Erro ao criar shapefile: {writer.errorMessage()}")
+
+            for feature in memory_layer.getFeatures():
+                if not writer.addFeature(feature):
+                    raise Exception(f"Erro ao adicionar feature: {writer.lastError()}")
+
+            del writer
+
+            self.export_summary.setText(
+                f"Prescrição exportada para: {output_path.name}"
+            )
+            QMessageBox.information(
+                self,
+                "Exportação",
+                "Prescrição exportada para Shapefile com sucesso.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                f"Não foi possível exportar a prescrição para Shapefile:\n{error}",
+            )
+
+    def _create_prescription_layer_copy(self, field_layer, prescription):
+        """Cria uma camada em memória com os resultados da prescrição."""
+        memory_layer = QgsVectorLayer(
+            f"{QgsWkbTypes.geometryType(field_layer.wkbType())}?crs={field_layer.crs().authid()}",
+            "prescricao_temporaria",
+            "memory",
+        )
+
+        provider = memory_layer.dataProvider()
+
+        fields = QgsFields()
+        fields.append(QgsField("talhao_id", QVariant.Int))
+        fields.append(QgsField("talhao_nome", QVariant.String))
+        fields.append(QgsField("media", QVariant.Double))
+        fields.append(QgsField("classe", QVariant.String))
+        fields.append(QgsField("dose", QVariant.Double))
+        fields.append(QgsField("quantidade_amostras", QVariant.Int))
+
+        provider.addAttributes(fields)
+        memory_layer.updateFields()
+
+        prescription_by_id = {
+            r["talhao_id"]: r for r in prescription.get("resultados", [])
+        }
+
+        features = []
+
+        for feature in field_layer.getFeatures():
+            field_id = int(feature.id())
+            result = prescription_by_id.get(field_id, {})
+
+            new_feature = QgsFeature()
+            new_feature.setGeometry(feature.geometry())
+
+            attrs = [
+                field_id,
+                result.get("talhao_nome", ""),
+                result.get("media"),
+                result.get("classe", ""),
+                result.get("dose"),
+                result.get("quantidade_amostras", 0),
+            ]
+
+            new_feature.setAttributes(attrs)
+            features.append(new_feature)
+
+        provider.addFeatures(features)
+
+        return memory_layer
+
+    def _export_agricultural_package(self):
+        """Exporta prescrição em formato de pacote agrícola (txt com coordenadas de aplicação)."""
+        prescription = (self.current_project or {}).get("prescricoes", {}).get("por_talhao")
+        field_layer = self._saved_field_layer()
+
+        if not prescription:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Gere uma prescrição antes de exportar o pacote agrícola.",
+            )
+            return
+
+        if not field_layer:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Camada de talhões não encontrada.",
+            )
+            return
+
+        export_dir = self._choose_export_folder()
+
+        if not export_dir:
+            return
+
+        output_path = Path(export_dir) / "pacote_agricola.txt"
+
+        try:
+            with output_path.open("w", encoding="utf-8") as f:
+                f.write("PACOTE AGRÍCOLA - SmartGrain\n")
+                f.write("=" * 60 + "\n\n")
+
+                project_info = self.current_project or {}
+                f.write(f"Projeto: {project_info.get('nome', 'N/A')}\n")
+                f.write(f"Propriedade: {project_info.get('propriedade', 'N/A')}\n")
+                f.write(f"Safra: {project_info.get('safra', 'N/A')}\n")
+                f.write(f"Responsável: {project_info.get('responsavel', 'N/A')}\n\n")
+
+                rules = prescription.get("regras", {})
+                f.write("REGRAS DE PRESCRIÇÃO\n")
+                f.write("-" * 60 + "\n")
+                f.write(f"Baixo: até {rules.get('baixo_ate')} | Dose: {rules.get('dose_baixa')}\n")
+                f.write(f"Médio: até {rules.get('medio_ate')} | Dose: {rules.get('dose_media')}\n")
+                f.write(f"Alto: acima disso | Dose: {rules.get('dose_alta')}\n\n")
+
+                f.write("PRESCRIÇÃO POR TALHÃO\n")
+                f.write("-" * 60 + "\n")
+                f.write("TALHÃO ID | NOME | CLASSE | DOSE | MÉDIA | AMOSTRAS\n")
+                f.write("-" * 60 + "\n")
+
+                prescription_by_id = {
+                    r["talhao_id"]: r for r in prescription.get("resultados", [])
+                }
+
+                for feature in field_layer.getFeatures():
+                    field_id = int(feature.id())
+                    result = prescription_by_id.get(field_id, {})
+
+                    if result:
+                        talhao_id = result.get("talhao_id", field_id)
+                        talhao_nome = result.get("talhao_nome", "")
+                        classe = result.get("classe", "N/A")
+                        dose = result.get("dose", 0)
+                        media = result.get("media", "N/A")
+                        amostras = result.get("quantidade_amostras", 0)
+
+                        f.write(
+                            f"{talhao_id:>8} | {talhao_nome:<10} | "
+                            f"{classe:<7} | {dose:>8} | {str(media):<8} | {amostras:>8}\n"
+                        )
+
+                f.write("\n" + "=" * 60 + "\n")
+                f.write("Arquivo gerado pelo SmartGrain Plugin para QGIS\n")
+
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                f"Não foi possível exportar o pacote agrícola:\n{error}",
+            )
+            return
+
+        self.export_summary.setText(
+            f"Pacote agrícola exportado para: {output_path.name}"
+        )
+        QMessageBox.information(
+            self,
+            "Exportação",
+            "Pacote agrícola exportado com sucesso.",
+        )
+
+
