@@ -36,6 +36,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..core.project_manager import ProjectManager
+from ..core.line_generator import LineGenerator
 
 
 class MainDialog(QDialog):
@@ -43,6 +44,7 @@ class MainDialog(QDialog):
         super().__init__(parent)
 
         self.project_manager = ProjectManager()
+        self.line_generator = LineGenerator()
         self.current_project = None
 
         self.setWindowTitle("SmartGrain")
@@ -54,6 +56,7 @@ class MainDialog(QDialog):
         self.tabs.addTab(self._build_data_tab(), "Dados")
         self.tabs.addTab(self._build_analysis_tab(), "Análises")
         self.tabs.addTab(self._build_prescription_tab(), "Prescrição")
+        self.tabs.addTab(self._build_lines_tab(), "Linhas")
         self.tabs.addTab(self._build_export_tab(), "Exportação")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -183,6 +186,7 @@ class MainDialog(QDialog):
         self._restore_selected_soil_sample_layer()
         self._restore_analysis_options()
         self._restore_prescription_options()
+        self._restore_lines_options()
         self._restore_export_options()
 
     def _open_project(self):
@@ -211,6 +215,7 @@ class MainDialog(QDialog):
         self._restore_selected_soil_sample_layer()
         self._restore_analysis_options()
         self._restore_prescription_options()
+        self._restore_lines_options()
         self._restore_export_options()
         QMessageBox.information(
             self,
@@ -1367,6 +1372,247 @@ class MainDialog(QDialog):
             return None
 
         return self.current_project.get("analises", {}).get("amostras_por_talhao")
+
+    def _build_lines_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Configuração do DEM
+        dem_box = QGroupBox("Configuração de curvas de nível")
+        form = QFormLayout(dem_box)
+
+        self.dem_path_input = QLineEdit()
+        self.dem_path_input.setReadOnly(True)
+
+        choose_dem_button = QPushButton("Escolher DEM/Raster")
+        choose_dem_button.clicked.connect(self._choose_dem_file)
+
+        dem_layout = QHBoxLayout()
+        dem_layout.addWidget(self.dem_path_input)
+        dem_layout.addWidget(choose_dem_button)
+
+        form.addRow("Arquivo DEM:", dem_layout)
+
+        # Parâmetros de geração
+        params_box = QGroupBox("Parâmetros de geração")
+        form_params = QFormLayout(params_box)
+
+        self.spacing_input = QDoubleSpinBox()
+        self.spacing_input.setRange(0.5, 100.0)
+        self.spacing_input.setValue(10.0)
+        self.spacing_input.setSingleStep(1.0)
+        self.spacing_input.setSuffix(" m")
+
+        self.smoothing_input = QDoubleSpinBox()
+        self.smoothing_input.setRange(0.0, 1.0)
+        self.smoothing_input.setValue(0.5)
+        self.smoothing_input.setSingleStep(0.1)
+        self.smoothing_input.setDecimals(2)
+
+        form_params.addRow("Espaçamento entre linhas:", self.spacing_input)
+        form_params.addRow("Intensidade de suavização:", self.smoothing_input)
+
+        # Status
+        self.lines_status = QLabel(
+            "Carregue um projeto, DEM e selecione um talhão para gerar linhas."
+        )
+        self.lines_status.setWordWrap(True)
+
+        self.lines_summary = QLabel("Nenhuma linha gerada.")
+        self.lines_summary.setWordWrap(True)
+        self.lines_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lines_summary.setStyleSheet(
+            "background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px;"
+        )
+
+        # Ações
+        generate_button = QPushButton("Gerar linhas")
+        generate_button.clicked.connect(self._generate_lines)
+
+        save_lines_button = QPushButton("Salvar linhas no projeto")
+        save_lines_button.clicked.connect(self._save_lines)
+
+        actions = QHBoxLayout()
+        actions.addWidget(generate_button)
+        actions.addWidget(save_lines_button)
+        actions.addStretch()
+
+        layout.addWidget(dem_box)
+        layout.addWidget(params_box)
+        layout.addWidget(self.lines_status)
+        layout.addWidget(self.lines_summary)
+        layout.addLayout(actions)
+        layout.addStretch()
+
+        self._restore_lines_options()
+        return tab
+
+    def _choose_dem_file(self):
+        dem_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Escolher arquivo DEM/Raster",
+            self.dem_path_input.text(),
+            "Raster Files (*.tif *.TIF *.tiff *.TIFF *.img *.IMG);;Todos os arquivos (*.*)",
+        )
+
+        if dem_file:
+            self.dem_path_input.setText(dem_file)
+            if self.line_generator.set_dem_layer(dem_file):
+                self.lines_status.setText(f"DEM carregado: {Path(dem_file).name}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Linhas",
+                    "O arquivo DEM não é válido.",
+                )
+                self.dem_path_input.setText("")
+
+    def _generate_lines(self):
+        if not self.current_project:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Crie ou abra um projeto antes de gerar linhas.",
+            )
+            return
+
+        field_layer = self._saved_field_layer()
+
+        if not field_layer:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Salve uma camada de talhões antes de gerar linhas.",
+            )
+            return
+
+        dem_path = self.dem_path_input.text().strip()
+
+        if not dem_path:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Escolha um arquivo DEM antes de gerar linhas.",
+            )
+            return
+
+        self.line_generator.set_field_layer(field_layer)
+        self.line_generator.set_spacing(self.spacing_input.value())
+        self.line_generator.set_smoothing_strength(self.smoothing_input.value())
+
+        try:
+            all_lines = []
+
+            for field_feature in field_layer.getFeatures():
+                lines = self.line_generator.generate_lines_for_field(field_feature)
+                
+                # Suavizar linhas
+                smoothed_lines = [
+                    self.line_generator.smooth_line(line)
+                    for line in lines
+                ]
+                
+                all_lines.extend(smoothed_lines)
+
+            if not all_lines:
+                QMessageBox.warning(
+                    self,
+                    "Linhas",
+                    "Nenhuma linha foi gerada. Verifique o DEM e os parâmetros.",
+                )
+                return
+
+            self.current_project["linhas"] = {
+                "linhas_geradas": self.line_generator.lines_to_dict(all_lines),
+                "parametros": {
+                    "espaçamento": self.spacing_input.value(),
+                    "suavização": self.smoothing_input.value(),
+                    "dem": dem_path,
+                },
+            }
+
+            self.lines_status.setText(f"Linhas geradas: {len(all_lines)} linhas")
+            self.lines_summary.setText(
+                f"Total de linhas geradas: {len(all_lines)}\n"
+                f"Espaçamento: {self.spacing_input.value():.1f} m\n"
+                f"Suavização: {self.smoothing_input.value():.2f}"
+            )
+
+            QMessageBox.information(
+                self,
+                "Linhas",
+                f"Foram geradas {len(all_lines)} linhas com sucesso.",
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Linhas",
+                f"Erro ao gerar linhas:\n{error}",
+            )
+
+    def _save_lines(self):
+        if not self.current_project:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Crie ou abra um projeto antes de salvar linhas.",
+            )
+            return
+
+        if "linhas" not in self.current_project:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Gere linhas antes de salvá-las.",
+            )
+            return
+
+        try:
+            self.project_manager.save_project(self.current_project)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self,
+                "Linhas",
+                f"Não foi possível salvar as linhas:\n{error}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Linhas",
+            "Linhas salvas no projeto com sucesso.",
+        )
+
+    def _restore_lines_options(self):
+        if not self.current_project:
+            self.lines_status.setText(
+                "Carregue um projeto, DEM e selecione um talhão para gerar linhas."
+            )
+            self.lines_summary.setText("Nenhuma linha gerada.")
+            return
+
+        saved_lines = self.current_project.get("linhas", {})
+
+        if saved_lines:
+            params = saved_lines.get("parametros", {})
+            dem_path = params.get("dem", "")
+
+            if dem_path:
+                self.dem_path_input.setText(dem_path)
+
+            self.spacing_input.setValue(params.get("espaçamento", 10.0))
+            self.smoothing_input.setValue(params.get("suavização", 0.5))
+
+            line_count = len(saved_lines.get("linhas_geradas", []))
+            self.lines_status.setText(f"Linhas salvas: {line_count}")
+            self.lines_summary.setText(
+                f"Linhas no projeto: {line_count}\n"
+                f"Espaçamento: {params.get('espaçamento', 'N/A'):.1f} m\n"
+                f"Suavização: {params.get('suavização', 'N/A'):.2f}"
+            )
+        else:
+            self.lines_status.setText("Nenhuma linha gerada neste projeto.")
+            self.lines_summary.setText("Gere linhas usando os parâmetros acima.")
 
     def _build_export_tab(self):
         tab = QWidget()
