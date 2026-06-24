@@ -1,3 +1,5 @@
+import csv
+import json
 from pathlib import Path
 
 from qgis.core import (
@@ -14,6 +16,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -174,6 +177,8 @@ class MainDialog(QDialog):
         self._restore_selected_field_layer()
         self._restore_selected_soil_sample_layer()
         self._restore_analysis_options()
+        self._restore_prescription_options()
+        self._restore_export_options()
 
     def _open_project(self):
         project_file, _ = QFileDialog.getOpenFileName(
@@ -200,6 +205,8 @@ class MainDialog(QDialog):
         self._restore_selected_field_layer()
         self._restore_selected_soil_sample_layer()
         self._restore_analysis_options()
+        self._restore_prescription_options()
+        self._restore_export_options()
         QMessageBox.information(
             self,
             "Projeto",
@@ -918,6 +925,8 @@ class MainDialog(QDialog):
         self.analysis_summary.setText(
             self._format_samples_by_field_analysis(analysis)
         )
+        self._restore_prescription_options()
+        self._restore_export_options()
         QMessageBox.information(
             self,
             "Análises",
@@ -1104,15 +1113,476 @@ class MainDialog(QDialog):
         return None
 
     def _build_prescription_tab(self):
-        return self._build_placeholder_tab(
-            "Prescrição de aplicação.",
-            "Esta etapa pode gerar recomendações por zona, fórmula, cultura ou atributo do mapa.",
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        prescription_box = QGroupBox("Prescrição por faixa")
+        form = QFormLayout(prescription_box)
+
+        self.prescription_attribute_label = QLabel("Nenhuma análise disponível.")
+
+        self.prescription_low_limit_input = self._build_decimal_input(8.0)
+        self.prescription_medium_limit_input = self._build_decimal_input(15.0)
+        self.prescription_low_dose_input = self._build_decimal_input(120.0)
+        self.prescription_medium_dose_input = self._build_decimal_input(80.0)
+        self.prescription_high_dose_input = self._build_decimal_input(40.0)
+
+        form.addRow("Atributo:", self.prescription_attribute_label)
+        form.addRow("Baixo até:", self.prescription_low_limit_input)
+        form.addRow("Médio até:", self.prescription_medium_limit_input)
+        form.addRow("Dose para baixo:", self.prescription_low_dose_input)
+        form.addRow("Dose para médio:", self.prescription_medium_dose_input)
+        form.addRow("Dose para alto:", self.prescription_high_dose_input)
+
+        generate_button = QPushButton("Gerar prescrição")
+        generate_button.clicked.connect(self._generate_field_prescription)
+
+        self.prescription_status = QLabel(
+            "Execute uma análise com atributo numérico antes de gerar a prescrição."
+        )
+        self.prescription_status.setWordWrap(True)
+
+        self.prescription_summary = QLabel("Nenhuma prescrição gerada.")
+        self.prescription_summary.setWordWrap(True)
+        self.prescription_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.prescription_summary.setStyleSheet(
+            "background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px;"
         )
 
+        actions = QHBoxLayout()
+        actions.addWidget(generate_button)
+        actions.addStretch()
+
+        layout.addWidget(prescription_box)
+        layout.addWidget(self.prescription_status)
+        layout.addWidget(self.prescription_summary)
+        layout.addLayout(actions)
+        layout.addStretch()
+
+        self._restore_prescription_options()
+        return tab
+
+    def _build_decimal_input(self, value):
+        input_widget = QDoubleSpinBox()
+        input_widget.setRange(-1000000.0, 1000000.0)
+        input_widget.setDecimals(4)
+        input_widget.setValue(value)
+        input_widget.setSingleStep(1.0)
+        return input_widget
+
+    def _restore_prescription_options(self):
+        if not hasattr(self, "prescription_attribute_label"):
+            return
+
+        analysis = self._saved_samples_by_field_analysis()
+        prescription = (self.current_project or {}).get("prescricoes", {}).get(
+            "por_talhao"
+        )
+
+        if not analysis or not analysis.get("atributo"):
+            self.prescription_attribute_label.setText("Nenhuma análise disponível.")
+            self.prescription_status.setText(
+                "Execute uma análise com atributo numérico antes de gerar a prescrição."
+            )
+            self.prescription_summary.setText("Nenhuma prescrição gerada.")
+            return
+
+        self.prescription_attribute_label.setText(analysis["atributo"])
+        self.prescription_status.setText(
+            "Análise disponível para gerar prescrição por talhão."
+        )
+
+        if prescription:
+            rules = prescription.get("regras", {})
+            self.prescription_low_limit_input.setValue(
+                float(rules.get("baixo_ate", self.prescription_low_limit_input.value()))
+            )
+            self.prescription_medium_limit_input.setValue(
+                float(
+                    rules.get(
+                        "medio_ate",
+                        self.prescription_medium_limit_input.value(),
+                    )
+                )
+            )
+            self.prescription_low_dose_input.setValue(
+                float(rules.get("dose_baixa", self.prescription_low_dose_input.value()))
+            )
+            self.prescription_medium_dose_input.setValue(
+                float(
+                    rules.get(
+                        "dose_media",
+                        self.prescription_medium_dose_input.value(),
+                    )
+                )
+            )
+            self.prescription_high_dose_input.setValue(
+                float(rules.get("dose_alta", self.prescription_high_dose_input.value()))
+            )
+            self.prescription_summary.setText(
+                self._format_field_prescription(prescription)
+            )
+
+    def _generate_field_prescription(self):
+        if not self.current_project:
+            QMessageBox.warning(
+                self,
+                "Prescrição",
+                "Crie ou abra um projeto antes de gerar a prescrição.",
+            )
+            return
+
+        analysis = self._saved_samples_by_field_analysis()
+
+        if not analysis or not analysis.get("atributo"):
+            QMessageBox.warning(
+                self,
+                "Prescrição",
+                "Execute uma análise com atributo numérico antes de gerar a prescrição.",
+            )
+            self._restore_prescription_options()
+            return
+
+        low_limit = self.prescription_low_limit_input.value()
+        medium_limit = self.prescription_medium_limit_input.value()
+
+        if medium_limit < low_limit:
+            QMessageBox.warning(
+                self,
+                "Prescrição",
+                "O limite médio deve ser maior ou igual ao limite baixo.",
+            )
+            return
+
+        prescription = self._field_prescription_from_analysis(
+            analysis,
+            {
+                "baixo_ate": low_limit,
+                "medio_ate": medium_limit,
+                "dose_baixa": self.prescription_low_dose_input.value(),
+                "dose_media": self.prescription_medium_dose_input.value(),
+                "dose_alta": self.prescription_high_dose_input.value(),
+            },
+        )
+
+        prescriptions = self.current_project.setdefault("prescricoes", {})
+        prescriptions["por_talhao"] = prescription
+
+        try:
+            self.project_manager.save_project(self.current_project)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self,
+                "Prescrição",
+                f"Não foi possível salvar a prescrição:\n{error}",
+            )
+            return
+
+        self.prescription_status.setText("Prescrição salva no projeto.")
+        self.prescription_summary.setText(
+            self._format_field_prescription(prescription)
+        )
+        self._restore_export_options()
+        QMessageBox.information(
+            self,
+            "Prescrição",
+            "Prescrição gerada e salva no projeto.",
+        )
+
+    def _field_prescription_from_analysis(self, analysis, rules):
+        results = []
+
+        for field_result in analysis.get("talhoes", []):
+            average = field_result.get("media")
+            classification = "sem média"
+            dose = None
+
+            if average is not None:
+                if average <= rules["baixo_ate"]:
+                    classification = "baixo"
+                    dose = rules["dose_baixa"]
+                elif average <= rules["medio_ate"]:
+                    classification = "médio"
+                    dose = rules["dose_media"]
+                else:
+                    classification = "alto"
+                    dose = rules["dose_alta"]
+
+            results.append(
+                {
+                    "talhao_id": field_result.get("talhao_id"),
+                    "talhao_nome": field_result.get("talhao_nome"),
+                    "media": average,
+                    "classe": classification,
+                    "dose": dose,
+                    "quantidade_amostras": field_result.get("quantidade_amostras", 0),
+                }
+            )
+
+        return {
+            "atributo": analysis.get("atributo", ""),
+            "regras": rules,
+            "resultados": results,
+        }
+
+    def _format_field_prescription(self, prescription):
+        rules = prescription.get("regras", {})
+        lines = [
+            f"Atributo: {prescription.get('atributo', '')}",
+            (
+                "Regras: "
+                f"baixo <= {rules.get('baixo_ate')}, "
+                f"médio <= {rules.get('medio_ate')}, "
+                "alto acima disso"
+            ),
+            (
+                "Doses: "
+                f"baixo {rules.get('dose_baixa')}, "
+                f"médio {rules.get('dose_media')}, "
+                f"alto {rules.get('dose_alta')}"
+            ),
+            "",
+            "Prescrição por talhão:",
+        ]
+
+        for result in prescription.get("resultados", []):
+            average = result.get("media")
+            average_text = f"{average:.4f}" if average is not None else "sem média"
+            dose = result.get("dose")
+            dose_text = f"{dose:.4f}" if dose is not None else "sem dose"
+            lines.append(
+                f"- {result.get('talhao_nome')}: média {average_text}, "
+                f"classe {result.get('classe')}, dose {dose_text}"
+            )
+
+        return "\n".join(lines)
+
+    def _saved_samples_by_field_analysis(self):
+        if not self.current_project:
+            return None
+
+        return self.current_project.get("analises", {}).get("amostras_por_talhao")
+
     def _build_export_tab(self):
-        return self._build_placeholder_tab(
-            "Exportação dos resultados.",
-            "Aqui podemos preparar arquivos para máquinas, monitores, relatórios e pacotes do projeto.",
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        export_box = QGroupBox("Exportação de resultados")
+        form = QFormLayout(export_box)
+
+        self.export_status = QLabel(
+            "Salve um projeto e gere análises/prescrições para ativar a exportação."
+        )
+        self.export_status.setWordWrap(True)
+
+        self.export_summary = QLabel("Nenhuma exportação gerada.")
+        self.export_summary.setWordWrap(True)
+        self.export_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.export_summary.setStyleSheet(
+            "background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px;"
+        )
+
+        export_project_button = QPushButton("Exportar projeto")
+        export_project_button.clicked.connect(self._export_project)
+
+        export_analysis_button = QPushButton("Exportar análise para CSV")
+        export_analysis_button.clicked.connect(self._export_analysis_to_csv)
+
+        export_prescription_button = QPushButton("Exportar prescrição para CSV")
+        export_prescription_button.clicked.connect(self._export_prescription_to_csv)
+
+        actions = QHBoxLayout()
+        actions.addWidget(export_project_button)
+        actions.addWidget(export_analysis_button)
+        actions.addWidget(export_prescription_button)
+        actions.addStretch()
+
+        layout.addWidget(export_box)
+        layout.addWidget(self.export_status)
+        layout.addWidget(self.export_summary)
+        layout.addLayout(actions)
+        layout.addStretch()
+
+        self._restore_export_options()
+        return tab
+
+    def _restore_export_options(self):
+        export_ready = False
+        analysis = self._saved_samples_by_field_analysis()
+        prescription = (self.current_project or {}).get("prescricoes", {}).get("por_talhao")
+
+        if self.current_project and analysis:
+            export_ready = True
+
+        if export_ready:
+            self.export_status.setText(
+                "Exportação disponível. Exporte projeto, análise ou prescrição."
+            )
+            self.export_summary.setText(
+                "Use os botões abaixo para gerar arquivos CSV no diretório do projeto."
+            )
+        else:
+            self.export_status.setText(
+                "Salve um projeto e gere análises/prescrições para ativar a exportação."
+            )
+            self.export_summary.setText("Nenhuma exportação gerada.")
+
+    def _export_project(self):
+        if not self.current_project:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Abra ou crie um projeto antes de exportar.",
+            )
+            return
+
+        project_dir = self.current_project.get("diretorio")
+
+        if not project_dir:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                "O projeto não possui diretório definido.",
+            )
+            return
+
+        project_path = Path(project_dir)
+        export_file = project_path / "projeto_exportado.json"
+
+        try:
+            with export_file.open("w", encoding="utf-8") as file:
+                json.dump(self.current_project, file, ensure_ascii=False, indent=2)
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                f"Não foi possível exportar o projeto:\n{error}",
+            )
+            return
+
+        self.export_summary.setText(
+            f"Projeto exportado para: {export_file.name}"
+        )
+        QMessageBox.information(
+            self,
+            "Exportação",
+            "Projeto exportado com sucesso.",
+        )
+
+    def _export_analysis_to_csv(self):
+        analysis = self._saved_samples_by_field_analysis()
+
+        if not analysis:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Execute uma análise antes de exportar para CSV.",
+            )
+            return
+
+        project_dir = self.current_project and self.current_project.get("diretorio")
+
+        if not project_dir:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                "O projeto não possui diretório definido.",
+            )
+            return
+
+        csv_path = Path(project_dir) / "analise_talhoes.csv"
+        try:
+            with csv_path.open("w", encoding="utf-8", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    "talhao_id",
+                    "talhao_nome",
+                    "quantidade_amostras",
+                    "media",
+                ])
+
+                for result in analysis.get("talhoes", []):
+                    writer.writerow([
+                        result.get("talhao_id"),
+                        result.get("talhao_nome"),
+                        result.get("quantidade_amostras", 0),
+                        result.get("media") if result.get("media") is not None else "",
+                    ])
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                f"Não foi possível exportar a análise:\n{error}",
+            )
+            return
+
+        self.export_summary.setText(
+            f"Análise exportada para: {csv_path.name}"
+        )
+        QMessageBox.information(
+            self,
+            "Exportação",
+            "Análise exportada para CSV com sucesso.",
+        )
+
+    def _export_prescription_to_csv(self):
+        prescription = (self.current_project or {}).get("prescricoes", {}).get("por_talhao")
+
+        if not prescription:
+            QMessageBox.warning(
+                self,
+                "Exportação",
+                "Gere uma prescrição antes de exportar para CSV.",
+            )
+            return
+
+        project_dir = self.current_project and self.current_project.get("diretorio")
+
+        if not project_dir:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                "O projeto não possui diretório definido.",
+            )
+            return
+
+        csv_path = Path(project_dir) / "prescricao_talhoes.csv"
+        try:
+            with csv_path.open("w", encoding="utf-8", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow([
+                    "talhao_id",
+                    "talhao_nome",
+                    "media",
+                    "classe",
+                    "dose",
+                    "quantidade_amostras",
+                ])
+
+                for result in prescription.get("resultados", []):
+                    writer.writerow([
+                        result.get("talhao_id"),
+                        result.get("talhao_nome"),
+                        result.get("media") if result.get("media") is not None else "",
+                        result.get("classe", ""),
+                        result.get("dose") if result.get("dose") is not None else "",
+                        result.get("quantidade_amostras", 0),
+                    ])
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                "Exportação",
+                f"Não foi possível exportar a prescrição:\n{error}",
+            )
+            return
+
+        self.export_summary.setText(
+            f"Prescrição exportada para: {csv_path.name}"
+        )
+        QMessageBox.information(
+            self,
+            "Exportação",
+            "Prescrição exportada para CSV com sucesso.",
         )
 
     def _build_placeholder_tab(self, title, description):
