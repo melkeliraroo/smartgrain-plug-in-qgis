@@ -8,6 +8,7 @@ from qgis.core import (
     QgsFeature,
     QgsField,
     QgsFields,
+    QgsPoint,
     QgsGeometry,
     QgsMapLayerType,
     QgsProject,
@@ -22,6 +23,7 @@ from qgis.PyQt.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -1409,8 +1411,35 @@ class MainDialog(QDialog):
         self.smoothing_input.setSingleStep(0.1)
         self.smoothing_input.setDecimals(2)
 
+        self.smoothing_method = QComboBox()
+        self.smoothing_method.addItem("Catmull-Rom", "catmull")
+        self.smoothing_method.addItem("Chaikin (rápido)", "chaikin")
+
+        self.smoothing_iterations = QSpinBox()
+        self.smoothing_iterations.setRange(1, 8)
+        self.smoothing_iterations.setValue(3)
+
+        self.smoothing_max_points = QSpinBox()
+        self.smoothing_max_points.setRange(10, 5000)
+        self.smoothing_max_points.setValue(1000)
+
+        self.merge_tolerance_input = QDoubleSpinBox()
+        self.merge_tolerance_input.setRange(0.1, 1000.0)
+        self.merge_tolerance_input.setValue(max(1.0, self.spacing_input.value() * 0.2))
+        self.merge_tolerance_input.setSingleStep(0.5)
+
+        self.merge_angle_input = QDoubleSpinBox()
+        self.merge_angle_input.setRange(0.0, 180.0)
+        self.merge_angle_input.setValue(40.0)
+        self.merge_angle_input.setSingleStep(1.0)
+
         form_params.addRow("Espaçamento entre linhas:", self.spacing_input)
         form_params.addRow("Intensidade de suavização:", self.smoothing_input)
+        form_params.addRow("Método de suavização:", self.smoothing_method)
+        form_params.addRow("Iterações (Chaikin):", self.smoothing_iterations)
+        form_params.addRow("Max pontos (amostragem):", self.smoothing_max_points)
+        form_params.addRow("Merge - tolerância (m):", self.merge_tolerance_input)
+        form_params.addRow("Merge - ângulo (°):", self.merge_angle_input)
 
         # Status
         self.lines_status = QLabel(
@@ -1432,9 +1461,20 @@ class MainDialog(QDialog):
         save_lines_button = QPushButton("Salvar linhas no projeto")
         save_lines_button.clicked.connect(self._save_lines)
 
+        preview_button = QPushButton("Visualizar no mapa")
+        preview_button.clicked.connect(self._preview_lines)
+
+        preview_merge_button = QPushButton("Visualizar fusão")
+        preview_merge_button.clicked.connect(self._preview_merge)
+
+        clear_preview_button = QPushButton("Limpar visualização")
+        clear_preview_button.clicked.connect(self._clear_lines_preview)
         actions = QHBoxLayout()
         actions.addWidget(generate_button)
         actions.addWidget(save_lines_button)
+        actions.addWidget(preview_button)
+        actions.addWidget(preview_merge_button)
+        actions.addWidget(clear_preview_button)
         actions.addStretch()
 
         layout.addWidget(dem_box)
@@ -1505,14 +1545,24 @@ class MainDialog(QDialog):
 
             for field_feature in field_layer.getFeatures():
                 lines = self.line_generator.generate_lines_for_field(field_feature)
-                
-                # Suavizar linhas
-                smoothed_lines = [
-                    self.line_generator.smooth_line(line)
-                    for line in lines
-                ]
-                
-                all_lines.extend(smoothed_lines)
+
+                method = self.smoothing_method.currentData()
+                iterations = int(self.smoothing_iterations.value())
+                max_pts = int(self.smoothing_max_points.value())
+
+                for line in lines:
+                    segments = self.line_generator.smooth_and_clip_line(
+                        line,
+                        field_feature.geometry(),
+                        self.smoothing_input.value(),
+                        method=method,
+                        iterations=iterations,
+                        max_points=max_pts,
+                    )
+
+                    for seg in segments:
+                        if seg and len(seg) >= 2:
+                            all_lines.append(seg)
 
             if not all_lines:
                 QMessageBox.warning(
@@ -1522,20 +1572,33 @@ class MainDialog(QDialog):
                 )
                 return
 
+            # Fundir segmentos próximos em linhas contínuas (usar valores da UI)
+            merge_tol = float(self.merge_tolerance_input.value())
+            angle_thresh = float(self.merge_angle_input.value())
+            merged_lines = self.line_generator.merge_segments(
+                all_lines, tolerance=merge_tol, angle_threshold_deg=angle_thresh
+            )
+
             self.current_project["linhas"] = {
-                "linhas_geradas": self.line_generator.lines_to_dict(all_lines),
+                "linhas_geradas": self.line_generator.lines_to_dict(merged_lines),
                 "parametros": {
                     "espaçamento": self.spacing_input.value(),
                     "suavização": self.smoothing_input.value(),
+                    "metodo_suavizacao": self.smoothing_method.currentData(),
+                    "iteracoes_suavizacao": int(self.smoothing_iterations.value()),
+                    "max_pontos_suavizacao": int(self.smoothing_max_points.value()),
                     "dem": dem_path,
+                    "merge_tolerance": float(self.merge_tolerance_input.value()),
+                    "merge_angle_threshold_deg": float(self.merge_angle_input.value()),
                 },
             }
 
-            self.lines_status.setText(f"Linhas geradas: {len(all_lines)} linhas")
+            self.lines_status.setText(f"Linhas geradas: {len(merged_lines)} linhas (fundidas)")
             self.lines_summary.setText(
-                f"Total de linhas geradas: {len(all_lines)}\n"
+                f"Total de linhas (após fusão): {len(merged_lines)}\n"
                 f"Espaçamento: {self.spacing_input.value():.1f} m\n"
-                f"Suavização: {self.smoothing_input.value():.2f}"
+                f"Suavização: {self.smoothing_input.value():.2f}\n"
+                f"Merge tol: {merge_tol:.2f}"
             )
 
             QMessageBox.information(
@@ -1583,6 +1646,199 @@ class MainDialog(QDialog):
             "Linhas salvas no projeto com sucesso.",
         )
 
+    def _preview_lines(self):
+        """Cria/atualiza uma camada temporária no QGIS para visualizar as linhas geradas."""
+        if not self.current_project or "linhas" not in self.current_project:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Gere linhas antes de visualizar no mapa.",
+            )
+            return
+
+        field_layer = self._saved_field_layer()
+
+        if not field_layer:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Camada de talhões não encontrada para referência de CRS.",
+            )
+            return
+
+        lines_data = self.current_project.get("linhas", {}).get("linhas_geradas", [])
+        lines = self.line_generator.dict_to_lines(lines_data)
+
+        if not lines:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Nenhuma linha disponível para visualização.",
+            )
+            return
+
+        # Remover preview anterior
+        self._clear_lines_preview()
+
+        crs_authid = field_layer.crs().authid() or "EPSG:4326"
+        layer_name = "Linhas_Preview"
+        uri = f"LineString?crs={crs_authid}"
+        preview_layer = QgsVectorLayer(uri, layer_name, "memory")
+        provider = preview_layer.dataProvider()
+
+        provider.addAttributes([QgsField("id", QVariant.Int)])
+        preview_layer.updateFields()
+
+        features = []
+
+        for i, line_points in enumerate(lines):
+            feat = QgsFeature()
+            try:
+                feat.setGeometry(QgsGeometry.fromPolyline(line_points))
+            except Exception:
+                # try using point XY pairing
+                try:
+                    pts = [QgsPoint(p.x(), p.y()) for p in line_points]
+                    feat.setGeometry(QgsGeometry.fromPolyline(pts))
+                except Exception:
+                    continue
+
+            feat.setAttributes([int(i)])
+            features.append(feat)
+
+        provider.addFeatures(features)
+        preview_layer.updateExtents()
+
+        QgsProject.instance().addMapLayer(preview_layer)
+        self.lines_preview_layer = preview_layer
+
+    def _preview_merge(self):
+        """Regenera as linhas (sem salvar), aplica a fusão com os parâmetros atuais e mostra a pré-visualização."""
+        if not self.current_project:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Crie ou abra um projeto antes de visualizar a fusão.",
+            )
+            return
+
+        field_layer = self._saved_field_layer()
+        if not field_layer:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Camada de talhões não encontrada para referência de CRS.",
+            )
+            return
+
+        dem_path = self.dem_path_input.text().strip()
+        if not dem_path:
+            QMessageBox.warning(
+                self,
+                "Linhas",
+                "Escolha um arquivo DEM antes de visualizar a fusão.",
+            )
+            return
+
+        # Configurar generator
+        self.line_generator.set_field_layer(field_layer)
+        self.line_generator.set_spacing(self.spacing_input.value())
+        self.line_generator.set_smoothing_strength(self.smoothing_input.value())
+
+        try:
+            all_lines = []
+            method = self.smoothing_method.currentData()
+            iterations = int(self.smoothing_iterations.value())
+            max_pts = int(self.smoothing_max_points.value())
+
+            for field_feature in field_layer.getFeatures():
+                lines = self.line_generator.generate_lines_for_field(field_feature)
+
+                for line in lines:
+                    segments = self.line_generator.smooth_and_clip_line(
+                        line,
+                        field_feature.geometry(),
+                        self.smoothing_input.value(),
+                        method=method,
+                        iterations=iterations,
+                        max_points=max_pts,
+                    )
+
+                    for seg in segments:
+                        if seg and len(seg) >= 2:
+                            all_lines.append(seg)
+
+            if not all_lines:
+                QMessageBox.warning(
+                    self,
+                    "Linhas",
+                    "Nenhuma linha foi gerada para pré-visualização.",
+                )
+                return
+
+            merge_tol = float(self.merge_tolerance_input.value())
+            angle_thresh = float(self.merge_angle_input.value())
+            merged_lines = self.line_generator.merge_segments(
+                all_lines, tolerance=merge_tol, angle_threshold_deg=angle_thresh
+            )
+
+            # Limpar preview anterior e desenhar
+            self._clear_lines_preview()
+
+            crs_authid = field_layer.crs().authid() or "EPSG:4326"
+            layer_name = "Linhas_Merge_Preview"
+            uri = f"LineString?crs={crs_authid}"
+            preview_layer = QgsVectorLayer(uri, layer_name, "memory")
+            provider = preview_layer.dataProvider()
+
+            provider.addAttributes([QgsField("id", QVariant.Int)])
+            preview_layer.updateFields()
+
+            features = []
+            for i, line_points in enumerate(merged_lines):
+                feat = QgsFeature()
+                try:
+                    feat.setGeometry(QgsGeometry.fromPolyline(line_points))
+                except Exception:
+                    try:
+                        pts = [QgsPoint(p.x(), p.y()) for p in line_points]
+                        feat.setGeometry(QgsGeometry.fromPolyline(pts))
+                    except Exception:
+                        continue
+
+                feat.setAttributes([int(i)])
+                features.append(feat)
+
+            provider.addFeatures(features)
+            preview_layer.updateExtents()
+
+            QgsProject.instance().addMapLayer(preview_layer)
+            self.lines_preview_layer = preview_layer
+
+            self.lines_status.setText(f"Pré-visualização de fusão: {len(merged_lines)} linhas")
+            self.lines_summary.setText(
+                f"Total de linhas (pré-visualização após fusão): {len(merged_lines)}\n"
+                f"Merge tol: {merge_tol:.2f} m | ângulo: {angle_thresh:.1f}°"
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Linhas",
+                f"Erro ao gerar pré-visualização de fusão:\n{error}",
+            )
+
+        self.lines_status.setText(f"Visualização criada: {len(features)} linhas")
+
+    def _clear_lines_preview(self):
+        """Remove a camada de visualização, se existir."""
+        try:
+            if hasattr(self, "lines_preview_layer") and self.lines_preview_layer:
+                QgsProject.instance().removeMapLayer(self.lines_preview_layer.id())
+                self.lines_preview_layer = None
+        except Exception:
+            self.lines_preview_layer = None
+
     def _restore_lines_options(self):
         if not self.current_project:
             self.lines_status.setText(
@@ -1602,6 +1858,15 @@ class MainDialog(QDialog):
 
             self.spacing_input.setValue(params.get("espaçamento", 10.0))
             self.smoothing_input.setValue(params.get("suavização", 0.5))
+            method = params.get("metodo_suavizacao", "catmull")
+            idx = self.smoothing_method.findData(method)
+            if idx >= 0:
+                self.smoothing_method.setCurrentIndex(idx)
+
+            self.smoothing_iterations.setValue(params.get("iteracoes_suavizacao", 3))
+            self.smoothing_max_points.setValue(params.get("max_pontos_suavizacao", 1000))
+            self.merge_tolerance_input.setValue(params.get("merge_tolerance", max(1.0, self.spacing_input.value() * 0.2)))
+            self.merge_angle_input.setValue(params.get("merge_angle_threshold_deg", 40.0))
 
             line_count = len(saved_lines.get("linhas_geradas", []))
             self.lines_status.setText(f"Linhas salvas: {line_count}")
